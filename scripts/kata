@@ -1,0 +1,481 @@
+#!/usr/bin/env bash
+# kata
+# CLI for katas using hurl (Bash, docker-compose only, gum-based UI)
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+CATALOG_DIR="$ROOT/katas-catalog"
+KATA_DIR="$ROOT/.kata"
+KATA_PHASES_DIR="$KATA_DIR/phases"
+KATA_ACTIVE_DIR="$KATA_DIR/active"
+KATA_LOGS_DIR="$KATA_DIR/logs"
+KATA_STATE_DIR="$KATA_DIR/state"
+SCAFFOLD_GLOBAL="$CATALOG_DIR/scaffold"
+
+GUM="$(command -v gum || true)"
+DOCKER_CLI="$(command -v docker || true)"
+
+# Helpers --------------------------------------------------------------------
+
+fail() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+require_tools() {
+    [ -n "$GUM" ] || fail "gum not found. Install from https://github.com/charmbracelet/gum"
+    [ -n "$DOCKER_CLI" ] || fail "docker not found. Install Docker and ensure 'docker compose' is available."
+    docker compose version >/dev/null 2>&1 || fail "'docker compose' not available. Use Docker with Compose v2 (command: docker compose)."
+}
+
+acquire_lock() {
+    local lockdir="$KATA_DIR/lock"
+    local tries=0
+    while ! mkdir "$lockdir" 2>/dev/null; do
+        sleep 0.05
+        tries=$((tries + 1))
+        if [ "$tries" -gt 200 ]; then
+            fail "Could not acquire lock on $lockdir"
+        fi
+    done
+}
+
+release_lock() {
+    rmdir "$KATA_DIR/lock" 2>/dev/null || true
+}
+
+atomic_write() {
+    local path="$1"
+    shift
+    local tmp="${path}.$$"
+    printf "%s" "$*" >"$tmp"
+    mv "$tmp" "$path"
+}
+
+ensure_dirs() {
+    mkdir -p "$CATALOG_DIR" "$KATA_DIR" "$KATA_PHASES_DIR" "$KATA_ACTIVE_DIR" "$KATA_LOGS_DIR" "$KATA_STATE_DIR"
+}
+
+is_git_repo() {
+    [ -d "$ROOT/.git" ]
+}
+
+git_is_clean() {
+    if ! is_git_repo; then
+        return 0
+    fi
+    (cd "$ROOT" && git status --porcelain 2>/dev/null | grep -q .) && return 1 || return 0
+}
+
+read_state_value() {
+    local file="$KATA_STATE_DIR/$1"
+    if [ -f "$file" ]; then
+        cat "$file"
+    else
+        echo ""
+    fi
+}
+
+write_state_value() {
+    local key="$1"
+    shift
+    local val="$*"
+    atomic_write "$KATA_STATE_DIR/$key" "$val"
+}
+
+list_phases() {
+    if [ ! -d "$KATA_PHASES_DIR" ]; then
+        return
+    fi
+    ls -1 "$KATA_PHASES_DIR" 2>/dev/null | sort
+}
+
+list_active() {
+    ls -1 "$KATA_ACTIVE_DIR" 2>/dev/null | sort || true
+}
+
+last_active_file() {
+    list_active | tail -n1 || true
+}
+
+phase_prefix() {
+    local fname="$1"
+    printf "%s" "$fname" | cut -d- -f1
+}
+
+next_phase_candidate() {
+    local phases active
+    mapfile -t phases < <(list_phases)
+    mapfile -t active < <(list_active)
+    for p in "${phases[@]}"; do
+        local found=false
+        for a in "${active[@]}"; do
+            if [ "$p" = "$a" ]; then
+                found=true
+                break
+            fi
+        done
+        if [ "$found" = false ]; then
+            printf "%s" "$p"
+            return 0
+        fi
+    done
+    return 1
+}
+
+copy_file_preserve_mode() {
+    local src="$1" dst="$2"
+    mkdir -p "$(dirname "$dst")"
+    cp -p "$src" "$dst"
+}
+
+# Commands -------------------------------------------------------------------
+
+cmd_init() {
+    require_tools
+    local kata_name="${1:-}"
+
+    if [ -z "$kata_name" ]; then
+        # Interactive kata selection with default = hello-world
+        local options
+        mapfile -t options < <(ls -1 "$CATALOG_DIR" | grep -v scaffold | sort)
+        if [ ${#options[@]} -eq 0 ]; then
+            fail "No katas available in $CATALOG_DIR"
+        fi
+        # gum choose expects arguments; pass them expanded
+        kata_name="$($GUM choose --header="Select a kata" --selected="hello-world" "${options[@]}")"
+    fi
+
+    [ -n "$kata_name" ] || fail "No kata selected."
+
+    if is_git_repo && ! git_is_clean; then
+        fail "Repo not clean. Commit or stash changes before running kata init."
+    fi
+
+    ensure_dirs
+
+    local global_yes_all=false global_no_all=false
+
+    # Apply global scaffold (interactive on conflicts)
+    if [ -d "$SCAFFOLD_GLOBAL" ]; then
+        while IFS= read -r -d '' file; do
+            local rel="${file#$SCAFFOLD_GLOBAL/}"
+            local dst="$ROOT/$rel"
+            if [ -e "$dst" ]; then
+                if [ "$global_yes_all" = true ]; then
+                    copy_file_preserve_mode "$file" "$dst"
+                    continue
+                fi
+                if [ "$global_no_all" = true ]; then
+                    continue
+                fi
+                local choice
+                choice="$($GUM choose --no-limit "overwrite" "skip" "overwrite all" "skip all")"
+                case "$choice" in
+                "overwrite") copy_file_preserve_mode "$file" "$dst" ;;
+                "skip") ;;
+                "overwrite all")
+                    global_yes_all=true
+                    copy_file_preserve_mode "$file" "$dst"
+                    ;;
+                "skip all") global_no_all=true ;;
+                esac
+            else
+                mkdir -p "$(dirname "$dst")"
+                copy_file_preserve_mode "$file" "$dst"
+            fi
+        done < <(find "$SCAFFOLD_GLOBAL" -type f -print0)
+    fi
+
+    # Apply kata-specific scaffold (overwrite files created by global scaffold; interactive otherwise)
+    local kata_scaffold="$CATALOG_DIR/$kata_name/scaffold"
+    local created_by_global=()
+    if [ -d "$SCAFFOLD_GLOBAL" ]; then
+        while IFS= read -r -d '' f; do
+            created_by_global+=("${f#$SCAFFOLD_GLOBAL/}")
+        done < <(find "$SCAFFOLD_GLOBAL" -type f -print0)
+    fi
+
+    local specific_yes_all=false specific_no_all=false
+    if [ -d "$kata_scaffold" ]; then
+        while IFS= read -r -d '' file; do
+            local rel="${file#$kata_scaffold/}"
+            local dst="$ROOT/$rel"
+            local in_global=false
+            for g in "${created_by_global[@]}"; do
+                [ "$g" = "$rel" ] && in_global=true && break
+            done
+            if [ -e "$dst" ] && [ "$in_global" = false ]; then
+                if [ "$specific_yes_all" = true ]; then
+                    copy_file_preserve_mode "$file" "$dst"
+                    continue
+                fi
+                if [ "$specific_no_all" = true ]; then
+                    continue
+                fi
+                local choice
+                choice="$($GUM choose --no-limit "overwrite" "skip" "overwrite all" "skip all")"
+                case "$choice" in
+                "overwrite") copy_file_preserve_mode "$file" "$dst" ;;
+                "skip") ;;
+                "overwrite all")
+                    specific_yes_all=true
+                    copy_file_preserve_mode "$file" "$dst"
+                    ;;
+                "skip all") specific_no_all=true ;;
+                esac
+            else
+                mkdir -p "$(dirname "$dst")"
+                # overwrite if it was created by global scaffold
+                copy_file_preserve_mode "$file" "$dst"
+            fi
+        done < <(find "$kata_scaffold" -type f -print0)
+    fi
+
+    # Copy phases to .kata/phases
+    rm -rf "$KATA_PHASES_DIR"/*
+    local phase_src_dir="$CATALOG_DIR/$kata_name/phases"
+    if [ ! -d "$phase_src_dir" ]; then
+        fail "kata phases not found: $phase_src_dir"
+    fi
+    for f in "$phase_src_dir"/*; do
+        [ -f "$f" ] || continue
+        copy_file_preserve_mode "$f" "$KATA_PHASES_DIR/$(basename "$f")"
+    done
+
+    # Initialize active with first phase
+    rm -rf "$KATA_ACTIVE_DIR"/*
+    local first_phase
+    first_phase="$(list_phases | sed -n '1p' || true)"
+    if [ -z "$first_phase" ]; then
+        fail "No phases found for kata $kata_name"
+    fi
+    copy_file_preserve_mode "$KATA_PHASES_DIR/$first_phase" "$KATA_ACTIVE_DIR/$first_phase"
+
+    # State: minimal set
+    write_state_value "kata_name" "$kata_name"
+    write_state_value "last_status" "not-run"
+    write_state_value "last_run_ts" ""
+
+    $GUM style --foreground 212 --border normal --padding "1" --align center "Initialized kata: $kata_name"
+    echo "Run 'scripts/kata run' to execute the first phase."
+    if $GUM confirm "Run the first phase now?"; then
+        cmd_run
+    fi
+
+}
+
+cmd_status() {
+    require_tools
+    ensure_dirs
+    local kata_name last_status last_run_ts active_count last_active
+    kata_name="$(read_state_value kata_name)"
+    last_status="$(read_state_value last_status)"
+    last_run_ts="$(read_state_value last_run_ts)"
+    active_count="$(list_active | wc -l | tr -d ' ')"
+    last_active="$(last_active_file || true)"
+    cat <<EOF | $GUM format --type markdown
+Kata: **$kata_name**
+Status: **$last_status**
+Last Run: **$last_run_ts**
+Active: **$active_count**
+Last Active: **$last_active**
+EOF
+}
+
+cmd_run() {
+    require_tools
+    ensure_dirs
+    local active_files
+    mapfile -t active_files < <(list_active)
+
+    if [ "${#active_files[@]}" -eq 0 ]; then
+        echo "No active phases to run."
+        return 0
+    fi
+
+    local failed_any=false
+    local failed_list=()
+    local ts
+    ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+
+    for af in "${active_files[@]}"; do
+        local prefix
+        prefix="$(phase_prefix "$af")"
+        local logpath="$KATA_LOGS_DIR/phase-${prefix}.log"
+        printf "
+--- Running phase %s ---
+" "$af" >&2
+
+        # run via docker compose; stream output to stderr and save into log file
+        if docker compose exec hurl hurl "/tests/$af" 2>&1 | tee "$logpath" >&2; then
+            printf "
+[OK] %s
+" "$af" >&2
+        else
+            printf "
+[FAILED] %s
+" "$af" >&2
+            failed_any=true
+            failed_list+=("$af")
+        fi
+    done
+
+    if [ "$failed_any" = true ]; then
+        write_state_value "last_status" "failed"
+        printf "%s
+" "${failed_list[@]}" >"$KATA_STATE_DIR/last_failed_files" 2>/dev/null || true
+        write_state_value "last_run_ts" "$ts"
+        $GUM style --foreground 196 --padding "1" "Run completed: FAILED. See .kata/logs/ for details."
+        # show failed files
+        $GUM format "Failed phases:
+$(printf '%s
+' "${failed_list[@]}")"
+        if $GUM confirm "Rerun tests now?"; then
+            cmd_run
+        fi
+        return 1
+    else
+        write_state_value "last_status" "passed"
+        write_state_value "last_run_ts" "$ts"
+        $GUM style --foreground 148 --padding "1" "Run completed: ALL PASSED"
+        # offer to advance
+        if $GUM confirm "Advance to next phase now?"; then
+            cmd_next
+        fi
+        return 0
+    fi
+}
+
+cmd_next() {
+    require_tools
+    ensure_dirs
+
+    local candidate
+    candidate="$(next_phase_candidate || true)"
+    if [ -z "$candidate" ]; then
+        # celebratory nerd message
+        cat <<'EOF'
+🏁 YOU DID IT — All phases cleared!
+
+☕️ Take a victory coffee, set phasers to stun, and maybe write a kata of your own.
+
+May your asserts be green and your refactors safe.
+EOF
+        return 0
+    fi
+
+    # check git dirty
+    if is_git_repo && ! git_is_clean; then
+        local choice
+        echo "Git working tree is dirty. It's recommended to commit your progress before advancing to the next phase."
+        choice="$($GUM choose --limit=1 "autocommit" "abort")"
+        echo "You chose: $choice"
+        if [ "$choice" != "autocommit" ]; then
+            echo "Aborted by user (dirty working tree)."
+            return 1
+        fi
+        # commit checkpoint
+        (cd "$ROOT" && git add -A && git commit -m "kata/autocommit $(read_state_value kata_name) $(basename "$candidate")") || {
+            fail "git commit failed. Aborting next."
+        }
+    fi
+
+    # copy next phase into active
+    copy_file_preserve_mode "$KATA_PHASES_DIR/$candidate" "$KATA_ACTIVE_DIR/$candidate"
+    write_state_value "last_status" "not-run"
+    write_state_value "last_run_ts" ""
+    $GUM style --foreground 40 --padding "1" "Enabled next phase: $candidate"
+}
+
+cmd_prev() {
+    require_tools
+    ensure_dirs
+    local last
+    last="$(last_active_file)"
+    if [ -z "$last" ]; then
+        echo "No active phases to remove."
+        return 0
+    fi
+    rm -f "$KATA_ACTIVE_DIR/$last"
+    write_state_value "last_status" "not-run"
+    write_state_value "last_run_ts" ""
+    $GUM style --padding "1" "Disabled phase: $last"
+}
+
+cmd_goto() {
+    require_tools
+    ensure_dirs
+    local target="${1:-}"
+
+    if [ -z "$target" ]; then
+        # Interactive selection of target phase
+        mapfile -t phases < <(list_phases)
+        if [ ${#phases[@]} -eq 0 ]; then
+            fail "No phases available"
+        fi
+        target="$($GUM choose --header="Select target phase" --limit=1 "${phases[@]}")"
+        [ -n "$target" ] || fail "No phase selected."
+    fi
+
+    # validate target exists in phases
+    if ! printf "%s
+" "$(list_phases)" | grep -xq "$target"; then
+        fail "Target phase not found: $target"
+    fi
+
+    # Build desired active set: all phases up to target (inclusive)
+    local desired=()
+    while IFS= read -r p; do
+        desired+=("$p")
+        [ "$p" = "$target" ] && break
+    done < <(list_phases)
+
+    # overwrite active dir with desired set
+    rm -rf "$KATA_ACTIVE_DIR"/*
+    for p in "${desired[@]}"; do
+        copy_file_preserve_mode "$KATA_PHASES_DIR/$p" "$KATA_ACTIVE_DIR/$p"
+    done
+    write_state_value "last_status" "not-run"
+    write_state_value "last_run_ts" ""
+    $GUM style --padding "1" "Set active phases up to: $target"
+}
+
+cmd_help() {
+    cat <<EOF
+Usage: scripts/kata <command> [args]
+
+Commands:
+  init <kata-name>     Initialize kata (apply scaffold, copy phases, enable first)
+  run                  Run enabled phases (uses docker compose hurl)
+  next                 Enable next phase (offers git checkpoint if repo dirty)
+  prev                 Disable last enabled phase
+  goto <phase>         Enable phases up to <phase>
+  status               Show current state
+  help                 Show this help
+EOF
+}
+
+# Dispatch ------------------------------------------------------------------
+
+if [ $# -lt 1 ]; then
+    cmd_help
+    exit 1
+fi
+
+cmd="$1"
+shift || true
+case "$cmd" in
+init) cmd_init "$@" ;;
+run) cmd_run "$@" ;;
+next) cmd_next "$@" ;;
+prev) cmd_prev "$@" ;;
+goto) cmd_goto "$@" ;;
+status) cmd_status "$@" ;;
+help) cmd_help ;;
+*)
+    echo "Unknown command: $cmd"
+    cmd_help
+    exit 2
+    ;;
+esac
